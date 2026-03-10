@@ -11,6 +11,7 @@ import argparse
 import ast
 import logging
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import torch
@@ -114,39 +115,62 @@ def main():
         for file in dataset_files
     }
 
-    # Process embeddings for each model
+    # Auto-detect subfolders
     embs_path = Path(args.embeddings_folder)
-    embs_files = list(embs_path.rglob("*mean_pooled.safetensors"))
+    subfolders = [f for f in embs_path.iterdir() if f.is_dir()]
+    
+    if not subfolders:
+        logging.error(f"No subfolders found in {args.embeddings_folder}")
+        return
+    
+    logging.info(f"Found {len(subfolders)} subfolders: {[f.name for f in subfolders]}")
 
-    for emb_file in tqdm(embs_files, desc="Filtering embeddings"):
-        model_name = emb_file.parent.name
-
-        try: 
-            # Load embeddings and metadata
-            embs = {}
-            with safe_open(emb_file, framework="pt") as f:
-                file_metadata = f.metadata()
-                for key in EMBEDDING_TYPES:
-                    embs[key] = f.get_tensor(key)
-            available_sent_ids = ast.literal_eval(file_metadata["sent_ids"])
+    # Group files by model across all subfolders
+    model_files = defaultdict(list)
+    
+    for subfolder in subfolders:
+        for emb_file in subfolder.rglob("*mean_pooled.safetensors"):
+            model_name = emb_file.parent.name
+            model_files[model_name].append(emb_file)
+    
+    # Process each model
+    for model_name, files in tqdm(model_files.items(), desc="Processing models"):
+        if len(files) != len(subfolders):
+            logging.warning(
+                f"Model {model_name} found in {len(files)}/{len(subfolders)} subfolders, skipping"
+            )
+            continue
+        
+        try:
+            # Load embeddings and metadata from all subfolders
+            all_embs_by_type = defaultdict(list)
+            all_sent_ids = []
             
-            # Extract dimensions and validate shape
-            first_emb = embs[EMBEDDING_TYPES[0]]
-            if first_emb.ndim != 3:
-                raise ValueError(
-                    f"Expected 3D embeddings (layers, sentences, features), "
-                    f"got {first_emb.ndim}D in {emb_file}"
-                )
+            for emb_file in sorted(files):
+                with safe_open(emb_file, framework="pt") as f:
+                    file_metadata = f.metadata()
+                    
+                    for key in EMBEDDING_TYPES:
+                        all_embs_by_type[key].append(f.get_tensor(key))
+                    
+                    current_sent_ids = ast.literal_eval(file_metadata["sent_ids"])
+                    all_sent_ids.extend(current_sent_ids)
+            
+            # Combine embeddings along sentence dimension
+            combined_embs = {
+                key: torch.cat(all_embs_by_type[key], dim=1)
+                for key in EMBEDDING_TYPES
+            }
+            first_emb = combined_embs[EMBEDDING_TYPES[0]]
             n_layers, vector_dim = first_emb.shape[0], first_emb.shape[2]
 
             # Filter embeddings for each dataset
             for dataset_name, dataset in datasets.items():
-                sent_id_pairs = list(
-                    zip(dataset["sent1_id"], dataset["sent2_id"])
-                )
+                sent_id_pairs = list(zip(dataset["sent1_id"], dataset["sent2_id"]))
+                
                 filtered_embs = {
                     key: build_paired_tensor(
-                        embs[key], available_sent_ids, sent_id_pairs
+                        combined_embs[key], all_sent_ids, sent_id_pairs
                     )
                     for key in EMBEDDING_TYPES
                 }
